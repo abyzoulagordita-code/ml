@@ -56,9 +56,18 @@ def load_data():
     except Exception:
         df_svc = pd.DataFrame(columns=['wash_record_id','service_offered'])
 
+    # Nombres reales de servicios (id → name)
+    svc_names = {}
+    try:
+        cur.execute("SELECT id, name FROM service_offered")
+        for row in cur.fetchall():
+            svc_names[str(row['id'])] = row['name']
+    except Exception:
+        pass
+
     conn.close()
     print(f"   Lavados cargados: {len(df)}")
-    return df, df_svc
+    return df, df_svc, svc_names
 
 
 # ── 2. Feature engineering ────────────────────────────────────────────────────
@@ -84,7 +93,7 @@ def engineer_features(df, df_svc):
 
 
 # ── 3. Estadísticas del negocio ────────────────────────────────────────────────
-def business_stats(df, df_svc):
+def business_stats(df, df_svc, svc_names={}):
     stats = {}
 
     # Lavados por día de semana
@@ -111,9 +120,11 @@ def business_stats(df, df_svc):
     # Ingreso promedio por lavado
     stats['avg_revenue_per_wash'] = round(float(df['total'].mean()), 0)
 
-    # Servicio más pedido
+    # Servicio más pedido (usando nombres reales si están disponibles)
     if not df_svc.empty:
         top_svc = df_svc['service_offered'].value_counts()
+        # Mapear IDs a nombres
+        top_svc.index = [svc_names.get(str(k), str(k)) for k in top_svc.index]
         stats['top_services'] = {str(k): int(v) for k,v in top_svc.items()}
         stats['top_service']  = str(top_svc.idxmax())
     else:
@@ -137,31 +148,36 @@ def business_stats(df, df_svc):
     return stats
 
 
-# ── 4. Etiquetas de demanda (por franja horaria) ───────────────────────────────
+# ── 4. Etiquetas de demanda (basadas en lavados por DÍA) ──────────────────────
 def create_demand_labels(df):
-    # Agrupamos por día + franja de 2 horas para tener granularidad real
+    """
+    Clasifica cada registro según qué tan ocupado fue ESE DÍA completo.
+    Así tenemos variación real: días lentos vs días pico.
+    """
     df = df.copy()
-    df['slot'] = df['date_only'].astype(str) + '_' + df['hour'].astype(str)
 
-    slot_count = df.groupby(['date_only','day_of_week','hour','is_weekend']).size().reset_index(name='count')
+    daily = df.groupby('date_only').size().reset_index(name='daily_count')
 
-    q33 = slot_count['count'].quantile(0.33)
-    q66 = slot_count['count'].quantile(0.66)
+    q33 = daily['daily_count'].quantile(0.33)
+    q66 = daily['daily_count'].quantile(0.66)
+
+    # Si los percentiles son iguales, forzamos separación
+    if q33 == q66:
+        q33 = daily['daily_count'].quantile(0.25)
+        q66 = daily['daily_count'].quantile(0.75)
 
     def label(n):
         if n <= q33: return 'Bajo'
         if n <= q66: return 'Medio'
         return 'Alto'
 
-    slot_count['demand'] = slot_count['count'].apply(label)
+    daily['demand'] = daily['daily_count'].apply(label)
 
-    # Merge de vuelta al df principal
-    df = df.merge(slot_count[['date_only','hour','demand']],
-                  on=['date_only','hour'], how='left')
+    df = df.merge(daily[['date_only','demand','daily_count']], on='date_only', how='left')
     df['demand'] = df['demand'].fillna('Bajo')
 
-    print(f"\n📊 Umbrales franja: Bajo≤{q33:.0f} | Medio≤{q66:.0f} | Alto>{q66:.0f} lavados/franja")
-    print(slot_count['demand'].value_counts().rename('franjas').to_string())
+    print(f"\n📊 Umbrales diarios: Bajo≤{q33:.0f} | Medio≤{q66:.0f} | Alto>{q66:.0f} lavados/día")
+    print(daily['demand'].value_counts().rename('días').to_string())
 
     return df, float(q33), float(q66)
 
@@ -270,9 +286,9 @@ if __name__ == '__main__':
     print("  WashApp PRO — Entrenamiento ML")
     print("=" * 55)
 
-    df_raw, df_svc = load_data()
+    df_raw, df_svc, svc_names = load_data()
     df = engineer_features(df_raw, df_svc)
-    stats = business_stats(df, df_svc)
+    stats = business_stats(df, df_svc, svc_names)
     df, q33, q66 = create_demand_labels(df)
     clf, features, model_name = train(df)
     save_model(clf, features, {'bajo': q33, 'medio': q66}, model_name, stats)
