@@ -1,0 +1,5 @@
+demand_model.pkl
+plots/
+__pycache__/
+*.pyc
+.env
