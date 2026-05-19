@@ -15,12 +15,15 @@ app = Flask(__name__)
 CORS(app)
 
 try:
-    artifact = joblib.load(MODEL_PATH)
-    clf      = artifact['model']
-    features = artifact['features']
-    stats    = artifact.get('stats', {})
+    artifact    = joblib.load(MODEL_PATH)
+    clf         = artifact['model']
+    features    = artifact['features']
+    stats       = artifact.get('stats', {})
+    services    = artifact.get('services', [])
+    pop_by_hour = artifact.get('pop_by_hour', {})
     print(f"✅ Modelo '{artifact['model_name']}' cargado ({artifact['trained_at'][:10]})")
     print(f"   Clases: {artifact['classes']}")
+    print(f"   Servicios para optimizador: {[s['name'] for s in services]}")
 except FileNotFoundError:
     print("❌ No se encontró demand_model.pkl — ejecuta train.py primero")
     raise
@@ -149,6 +152,59 @@ def plan_dia(dia_semana):
         }
 
         return jsonify({'resumen': resumen, 'horas': horas})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/optimizar/<dia_semana>', methods=['GET'])
+def optimizar_dia(dia_semana):
+    """
+    Maximización de ingresos usando Programación Lineal.
+    Retorna el mix óptimo de servicios por hora y el ingreso máximo posible.
+    """
+    try:
+        from optimizer import optimize_revenue_day
+
+        if dia_semana not in DAY_MAP:
+            return jsonify({'error': f"Día inválido: {dia_semana}"}), 400
+
+        if not services:
+            return jsonify({'error': 'No hay servicios registrados en la BD'}), 404
+
+        # Demanda y empleados por hora (desde el modelo ML)
+        demand_by_hour   = {}
+        employees_by_hour = {}
+        washes_by_hour   = stats.get('washes_by_hour', {})
+
+        for h in range(7, 19):
+            pred, _ = predict_hour(h, dia_semana)
+            # Convertir predicción a número esperado de autos
+            base = washes_by_hour.get(h, 1)
+            avg  = stats.get('avg_washes_per_day', 8) / 11
+            if pred == 'Alto':
+                demand_by_hour[h]    = max(base, avg * 1.4)
+                employees_by_hour[h] = 3
+            elif pred == 'Medio':
+                demand_by_hour[h]    = max(base, avg * 1.0)
+                employees_by_hour[h] = 2
+            else:
+                demand_by_hour[h]    = max(base, avg * 0.6)
+                employees_by_hour[h] = 1
+
+        # Ajustar popularidad por hora si está disponible
+        svc_list = []
+        for s in services:
+            h_pop = pop_by_hour.get(str(h), {})
+            svc_list.append({**s, 'popularity': h_pop.get(s['id'], s['popularity'])})
+
+        resultado = optimize_revenue_day(services, demand_by_hour, employees_by_hour)
+        resultado['dia']      = dia_semana
+        resultado['servicios'] = [{'name': s['name'], 'price': s['price'],
+                                   'popularity': round(s['popularity']*100, 1)}
+                                  for s in services]
+
+        return jsonify(resultado)
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500

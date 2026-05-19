@@ -56,18 +56,41 @@ def load_data():
     except Exception:
         df_svc = pd.DataFrame(columns=['wash_record_id','service_offered'])
 
-    # Nombres reales de servicios (id → name)
-    svc_names = {}
+    # Catálogo completo de servicios (id → {name, price, duration})
+    svc_names   = {}
+    svc_catalog = {}
     try:
-        cur.execute("SELECT id, name FROM service_offered")
+        cur.execute("SELECT id, name, price, duration FROM service_offered")
         for row in cur.fetchall():
-            svc_names[str(row['id'])] = row['name']
+            sid  = str(row['id'])
+            name = row['name']
+            svc_names[sid]   = name
+            svc_catalog[sid] = {
+                'name':     name,
+                'price':    float(row['price'] or 0),
+                'duration': str(row['duration'] or '30'),
+            }
+    except Exception:
+        pass
+
+    # Popularidad de servicios por hora (para el optimizador)
+    svc_by_hour = pd.DataFrame()
+    try:
+        cur.execute("""
+            SELECT wrs.service_offered AS svc_id,
+                   HOUR(wr.date)       AS hour,
+                   COUNT(*)            AS cnt
+            FROM   wash_record_service_offered wrs
+            JOIN   wash_record wr ON wr.id = wrs.wash_record_id
+            GROUP  BY wrs.service_offered, HOUR(wr.date)
+        """)
+        svc_by_hour = pd.DataFrame(cur.fetchall())
     except Exception:
         pass
 
     conn.close()
     print(f"   Lavados cargados: {len(df)}")
-    return df, df_svc, svc_names
+    return df, df_svc, svc_names, svc_catalog, svc_by_hour
 
 
 # ── 2. Feature engineering ────────────────────────────────────────────────────
@@ -93,6 +116,46 @@ def engineer_features(df, df_svc):
 
 
 # ── 3. Estadísticas del negocio ────────────────────────────────────────────────
+def build_services_for_optimizer(svc_catalog, df_svc, svc_by_hour):
+    """Construye la lista de servicios con popularidad global para el LP."""
+    from optimizer import parse_duration
+
+    if df_svc.empty or not svc_catalog:
+        return []
+
+    total_counts = df_svc['service_offered'].value_counts()
+    total        = max(1, total_counts.sum())
+
+    services = []
+    for sid, info in svc_catalog.items():
+        if info['price'] <= 0:
+            continue
+        pop = float(total_counts.get(sid, 0)) / total
+        services.append({
+            'id':           sid,
+            'name':         info['name'],
+            'price':        info['price'],
+            'duration_min': parse_duration(info['duration']),
+            'popularity':   pop,
+        })
+
+    # Popularidad por hora → dict {hora: {sid: fraction}}
+    pop_by_hour = {}
+    if not svc_by_hour.empty:
+        for hora in range(7, 19):
+            h_data = svc_by_hour[svc_by_hour['hour'] == hora]
+            if h_data.empty:
+                pop_by_hour[hora] = {s['id']: s['popularity'] for s in services}
+                continue
+            h_total = max(1, h_data['cnt'].sum())
+            pop_by_hour[hora] = {
+                str(row['svc_id']): float(row['cnt']) / h_total
+                for _, row in h_data.iterrows()
+            }
+
+    return services, pop_by_hour
+
+
 def business_stats(df, df_svc, svc_names={}):
     stats = {}
 
@@ -221,18 +284,23 @@ def train(df):
 
 
 # ── 6. Guardar modelo + estadísticas ──────────────────────────────────────────
-def save_model(clf, features, thresholds, model_name, stats):
+def save_model(clf, features, thresholds, model_name, stats,
+               services=None, pop_by_hour=None):
     artifact = {
-        'model':      clf,
-        'features':   features,
-        'thresholds': thresholds,
-        'model_name': model_name,
-        'trained_at': datetime.now().isoformat(),
-        'classes':    list(clf.classes_),
-        'stats':      stats,       # <── estadísticas reales del negocio
+        'model':        clf,
+        'features':     features,
+        'thresholds':   thresholds,
+        'model_name':   model_name,
+        'trained_at':   datetime.now().isoformat(),
+        'classes':      list(clf.classes_),
+        'stats':        stats,
+        'services':     services  or [],
+        'pop_by_hour':  pop_by_hour or {},
     }
     joblib.dump(artifact, MODEL_PATH)
     print(f"\n💾 Modelo guardado: {MODEL_PATH}")
+    if services:
+        print(f"   Servicios para optimizador: {[s['name'] for s in services]}")
 
 
 # ── 7. Gráficas ────────────────────────────────────────────────────────────────
@@ -286,12 +354,15 @@ if __name__ == '__main__':
     print("  WashApp PRO — Entrenamiento ML")
     print("=" * 55)
 
-    df_raw, df_svc, svc_names = load_data()
+    df_raw, df_svc, svc_names, svc_catalog, svc_by_hour = load_data()
     df = engineer_features(df_raw, df_svc)
     stats = business_stats(df, df_svc, svc_names)
+    services_result = build_services_for_optimizer(svc_catalog, df_svc, svc_by_hour)
+    services, pop_by_hour = services_result if services_result else ([], {})
     df, q33, q66 = create_demand_labels(df)
     clf, features, model_name = train(df)
-    save_model(clf, features, {'bajo': q33, 'medio': q66}, model_name, stats)
+    save_model(clf, features, {'bajo': q33, 'medio': q66},
+               model_name, stats, services, pop_by_hour)
     plot_insights(df, stats)
 
     print("\n✅ Entrenamiento completo.")
